@@ -8,6 +8,8 @@ import ssl
 import subprocess
 import requests
 import pyaudio
+import audioop
+from core.event_bus import bus
 
 # 全局忽略 Mac 环境下自带 SSL 根证书缺失的报错
 import certifi
@@ -23,7 +25,7 @@ os.environ["WEBSOCKET_CLIENT_CA_BUNDLE"] = ""
 # 尝试导入 CosyVoice 依赖
 try:
     import dashscope
-    from dashscope.audio.tts_v2 import SpeechSynthesizer, ResultCallback
+    from dashscope.audio.tts_v2 import SpeechSynthesizer, ResultCallback, AudioFormat
     from dashscope.audio.tts_v2 import VoiceEnrollmentService
     HAS_DASH_SCOPE = True
 except ImportError:
@@ -130,8 +132,21 @@ class CosyVoiceEngine(TTSEngineBase):
         self.p = pyaudio.PyAudio()
         self.stream = None
         self.synthesizer = None
+        env_output_index = os.getenv("TTS_OUTPUT_DEVICE_INDEX")
+        if env_output_index is not None:
+            self.output_device_index = int(env_output_index)
+        else:
+            # 默认使用系统当前输出设备，避免外设插拔导致索引漂移
+            try:
+                self.output_device_index = int(self.p.get_default_output_device_info().get("index", 0))
+            except Exception:
+                self.output_device_index = 0
+        self.output_gain = float(os.getenv("TTS_OUTPUT_GAIN", "1.8"))
+        self.output_channels = int(os.getenv("TTS_OUTPUT_CHANNELS", "2"))
         # 控制打断的标志
         self._abort = False
+        # 增加互斥锁，确保 LLM 吐出的碎句按顺序一段段播，不打架
+        self._lock = threading.Lock()
 
     def _upload_to_catbox(self):
         print(f"  [系统] 正在上传原声母本到稳定中转站 (uguu.se) 供百炼下载...")
@@ -152,6 +167,16 @@ class CosyVoiceEngine(TTSEngineBase):
         if not os.path.exists(self.prompt_audio_path):
             print(f"  ❌ [CosyVoice] 找不到原声音频文件: {self.prompt_audio_path}")
             return False
+
+        try:
+            d = self.p.get_device_info_by_index(self.output_device_index)
+            print(
+                "  [TTS] Output Device => "
+                f"index={self.output_device_index}, name={d.get('name')}, "
+                f"channels={self.output_channels}, gain={self.output_gain}"
+            )
+        except Exception:
+            print(f"  ⚠️ [TTS] 无法读取输出设备 index={self.output_device_index}，将按默认行为尝试播放")
 
         prompt_url = self._upload_to_catbox()
         if not prompt_url:
@@ -177,64 +202,92 @@ class CosyVoiceEngine(TTSEngineBase):
         if not self.voice_id or not text.strip() or self._abort:
             return
 
-        self.is_speaking = True
-        self._abort = False
-        first_chunk_played = False
-        
-        # 准备扬声器推流器 (CosyVoice v1 默认返回 22050Hz, 16bit MONO pcm数据流)
-        if self.stream is None or not self.stream.is_active():
-            self.stream = self.p.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=22050, 
-                output=True
-            )
+        # 锁住整段合成+播放，避免并发句子同时写声卡导致底层崩溃
+        with self._lock:
+            self.is_speaking = True
+            self._abort = False
+            first_chunk_played = False
+            done_event = threading.Event()
 
-        class AudioCallback(ResultCallback):
-            def __init__(self, engine_ref):
-                self.engine = engine_ref
-                
-            def on_open(self):
-                pass
-                
-            def on_complete(self):
-                pass
-                
-            def on_error(self, message):
-                print(f"\n  [CosyVoice 错误]: {message}")
-                
-            def on_close(self):
-                pass
-                
-            def on_event(self, message):
-                # 碰到用户打断，直接丢弃收到的网络包
-                if self.engine._abort:
-                    return
-                # 将下发的 pcm 二进制音频块直接怼给喇叭，实现极速播放
-                if isinstance(message, bytes) and len(message) > 0:
+            # 准备扬声器推流器 (CosyVoice v1 默认返回 22050Hz, 16bit MONO pcm数据流)
+            if self.stream is None or not self.stream.is_active():
+                print(f"[TTS] 🎤 Opening PyAudio stream (Device Index: {self.output_device_index}, Channels: {self.output_channels})...")
+                self.stream = self.p.open(
+                    format=pyaudio.paInt16,
+                    channels=self.output_channels,
+                    rate=22050,
+                    output=True,
+                    output_device_index=self.output_device_index
+                )
+
+            class AudioCallback(ResultCallback):
+                def __init__(self, engine_ref):
+                    self.engine = engine_ref
+
+                def on_open(self):
+                    print("[TTS] 🌐 DashScope Connection Open")
+
+                def on_complete(self):
+                    print("[TTS] 🏁 DashScope Synthesis Complete")
+                    # 播放完成，发布事件
+                    bus.publish("ai_speak_end")
+                    done_event.set()
+
+                def on_error(self, message):
+                    print(f"\n  [CosyVoice 错误]: {message}")
+                    bus.publish("tts_error", error=message)
+                    done_event.set()
+
+                def on_close(self):
+                    print("[TTS] 🔴 DashScope Connection Closed")
+                    done_event.set()
+
+                def on_event(self, message):
+                    # 事件消息仅做简短日志，音频数据在 on_data 回调里处理
+                    msg_str = str(message)
+                    print(f"[TTS] 💬 Event String: {msg_str[:150]}")
+
+                def on_data(self, data: bytes):
                     nonlocal first_chunk_played
+                    if self.engine._abort or not data:
+                        return
+
+                    data_to_play = data
+                    # DashScope 返回 mono PCM；双声道输出设备下复制到左右声道，减少线材兼容问题
+                    if self.engine.output_channels == 2:
+                        data_to_play = audioop.tostereo(data_to_play, 2, 1, 1)
+                    if self.engine.output_gain != 1.0:
+                        data_to_play = audioop.mul(data_to_play, 2, self.engine.output_gain)
+
                     if not first_chunk_played:
+                        rms = audioop.rms(data, 2)
+                        print(f"[TTS] 🔊 First audio chunk received: {len(data)} bytes, rms={rms}")
                         if playback_callback:
                             playback_callback()
+                        bus.publish("ai_speak_start")
                         first_chunk_played = True
+
                     try:
-                        self.engine.stream.write(message)
+                        self.engine.stream.write(data_to_play)
                     except Exception as e:
                         print(f"  [流写入报错]: {e}")
 
-        self.synthesizer = SpeechSynthesizer(
-            model="cosyvoice-v1",
-            voice=self.voice_id,
-            callback=AudioCallback(self)
-        )
+            self.synthesizer = SpeechSynthesizer(
+                model="cosyvoice-v1",
+                voice=self.voice_id,
+                format=AudioFormat.PCM_22050HZ_MONO_16BIT,
+                callback=AudioCallback(self)
+            )
 
-        try:
-            # 阻塞调用，但 callback 会在云端首包到达立刻异步触发播放
-            self.synthesizer.call(text=text)
-        except Exception as e:
-            print(f"  ❌ [CosyVoice] 合成过程异常: {e}")
-        finally:
-            self.is_speaking = False
+            try:
+                # 阻塞调用，但 callback 会在云端首包到达立刻异步触发播放
+                self.synthesizer.call(text=text)
+                # 某些 SDK 版本 call() 会快速返回，需等待回调完成后再放下一句
+                done_event.wait(timeout=30)
+            except Exception as e:
+                print(f"  ❌ [CosyVoice] 合成过程异常: {e}")
+            finally:
+                self.is_speaking = False
 
     def stop(self):
         self._abort = True
@@ -268,7 +321,7 @@ if __name__ == "__main__":
         engine.speak_streaming("你好，我是Edge机器音，由于我缓存文件播放，延迟肯定有点高。", playback_callback=on_first_audio)
         
     elif test_mode == "cosy":
-        api_key = "sk-a7f14f9ea7b34373b8c4f72e013b651e"
+        api_key = os.getenv("LLM_API_KEY")
         audio_path = os.path.join(os.path.dirname(__file__), "my_voice.wav")
         engine = CosyVoiceEngine(api_key, audio_path)
         

@@ -5,8 +5,8 @@ from dashscope.audio.tts_v2 import SpeechSynthesizer
 import pyaudio
 
 # ================= 阿里云百炼配置 =================
-# 这里复用您刚才的通义千问 API KEY
-dashscope.api_key = "sk-a7f14f9ea7b34373b8c4f72e013b651e"
+import os
+dashscope.api_key = os.getenv("LLM_API_KEY")
 
 import requests
 from dashscope.audio.tts_v2 import VoiceEnrollmentService
@@ -16,14 +16,15 @@ import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
 
 def upload_to_catbox(file_path):
-    print(f"[系统] 正在准备您的声音母本...")
+    print(f"[系统] 正在上传原声母本到稳定中转站 (uguu.se)...")
     try:
-        url = "https://litterbox.catbox.moe/resources/internals/api.php"
-        data = {'reqtype': 'fileupload', 'time': '1h'}
+        url = "https://uguu.se/upload.php"
         with open(file_path, 'rb') as f:
-            r = requests.post(url, data=data, files={'fileToUpload': f}, timeout=15)
-        if r.status_code == 200 and r.text.startswith("https"):
-            return r.text.strip()
+            r = requests.post(url, files={'files[]': f}, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get('success') and data.get('files'):
+                return data['files'][0]['url']
     except Exception as e:
         print(f"上传声音母本失败: {e}")
     return None
